@@ -1,0 +1,7 @@
+{
+  "origin": "课程固定提示词，仅用于生成展示，不参与主榜；不是斯坦福官方测试题。",
+  "prompts": ["Once upon a time, there was a little rabbit who", "Lily found a small key in the garden. She", "Tom wanted to help his friend, but"],
+  "max_new_tokens": 256,
+  "seed": 336,
+  "sampling": {"temperature": 0.8, "top_p": 0.9}
+}

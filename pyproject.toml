@@ -1,0 +1,33 @@
+[project]
+name = "cs336-course-kit"
+version = "2.0.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "torch==2.11.0", "numpy==2.5.3", "regex==2026.9.10",
+  "einops==0.8.2", "jaxtyping==0.3.11", "psutil==7.2.2",
+  "pytest==9.1.1", "pytest-timeout==2.4.0", "tiktoken==0.14.0",
+  "matplotlib==3.11.2",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[dependency-groups]
+portal = [
+    "fastapi>=0.141.1",
+    "httpx>=0.28.1",
+    "python-multipart>=0.0.32",
+    "uvicorn>=0.54.0",
+]

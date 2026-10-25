@@ -1,0 +1,18 @@
+# Course data and training artifacts (not tracked: too large / licensed)
+data/
+artifacts/
+runs/
+*.pt
+*.npy
+preflight.json
+submission.zip
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+uv_cache/
+
+# Local session state
+worklog/

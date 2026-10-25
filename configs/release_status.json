@@ -1,0 +1,13 @@
+{
+  "format_version": 2,
+  "student_tracks": [
+    "low"
+  ],
+  "tracks": {
+    "low": {
+      "ready": false,
+      "nll_limit": 1.7,
+      "status": "submission_not_open_teacher_will_announce"
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "low": {
+    "token_budget": 40960000,
+    "nll_limit": 1.7
+  }
+}
