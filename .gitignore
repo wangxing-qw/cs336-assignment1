@@ -16,3 +16,7 @@ uv_cache/
 
 # Local session state
 worklog/
+
+# Submission deliverables and third-party reference material (large binaries)
+submission/
+kdd/

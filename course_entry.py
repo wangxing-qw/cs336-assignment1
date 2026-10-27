@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from basics.hybrid_muon import HybridMuonAdamW
 from basics.model import Embedding, Linear, MultiHeadSelfAttention, build_model
 from basics.nn_utils import cross_entropy, cross_entropy_per_token, gradient_clipping
 from basics.optimizer import AdamW, get_lr_cosine_schedule
@@ -86,7 +87,10 @@ def _apply_model_options(model, config: dict) -> None:
                 torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             elif isinstance(module, Embedding):
                 torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-    if config.get("init_residual_scale", False):
+    residual_scale = bool(config.get("init_residual_scale", False)) or (
+        config.get("initialization") == "residual_depth_scaled"
+    )
+    if residual_scale:
         num_layers = int(_resolve_model_config(config)["num_layers"])
         scale = 1.0 / math.sqrt(2.0 * num_layers)
         for layer in model.layers:
@@ -367,6 +371,87 @@ def _lr_at(step: int, config: dict, total_steps: int) -> float:
     return min_lr + (peak - min_lr) * factor
 
 
+def _phase_batch(config: dict, tokens: int) -> int:
+    """Global batch (sequences per update) at a token position."""
+    phases = config.get("batch_phases")
+    if not phases:
+        return int(config["micro_batch_size"]) * int(config["gradient_accumulation"])
+    for phase in phases:
+        if tokens < int(phase["end_tokens"]):
+            return int(phase["batch"])
+    return int(phases[-1]["batch"])
+
+
+def _update_quantum(config: dict, tokens: int) -> int:
+    """Tokens consumed by the next update, split at schedule boundaries."""
+    context = int(_resolve_model_config(config)["context_length"])
+    unit = int(config["micro_batch_size"]) * context
+    boundaries = [int(config["token_budget"])]
+    boundaries += [int(m) for m in config.get("milestones", [])]
+    boundaries += [int(p["end_tokens"]) for p in config.get("batch_phases", [])]
+    if config.get("untie_at_tokens"):
+        boundaries.append(int(config["untie_at_tokens"]))
+    remaining = min(b for b in boundaries if b > tokens) - tokens
+    quantum = min(_phase_batch(config, tokens) * context, remaining)
+    if quantum % unit:
+        raise ValueError("batch schedule does not tile the token budget")
+    return quantum
+
+
+def _total_updates(config: dict) -> int:
+    tokens, steps, budget = 0, 0, int(config["token_budget"])
+    while tokens < budget:
+        quantum = _update_quantum(config, tokens)
+        if quantum <= 0:
+            raise ValueError("batch schedule made no progress")
+        tokens += quantum
+        steps += 1
+    return steps
+
+
+def _token_lr(tokens: int, config: dict) -> float:
+    """Token-progress WSD schedule (``lr_schedule="warmup_stable_decay"``)."""
+    peak = float(config["learning_rate"])
+    floor = float(config["min_learning_rate"])
+    budget = int(config["token_budget"])
+    default_warm = (
+        int(config["warmup_steps"])
+        * int(config["micro_batch_size"])
+        * int(config["gradient_accumulation"])
+        * int(_resolve_model_config(config)["context_length"])
+    )
+    warm = int(config.get("warmup_tokens", default_warm))
+    if warm and tokens <= warm:
+        return peak * tokens / warm
+    start = budget * (1.0 - float(config.get("decay_fraction", 0.6)))
+    if tokens <= start:
+        return peak
+    progress = min(1.0, (tokens - start) / max(1.0, budget - start))
+    return floor + (peak - floor) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+def _label_smoothing(config: dict, tokens: int) -> float:
+    strength = float(config.get("early_label_smoothing", 0.0))
+    if not strength:
+        return 0.0
+    plateau = float(config.get("smoothing_plateau_fraction", 0.5))
+    zero = float(config.get("smoothing_zero_fraction", 0.75))
+    progress = tokens / int(config["token_budget"])
+    if progress <= plateau:
+        return strength
+    return strength * max(0.0, (zero - progress) / max(1e-9, zero - plateau))
+
+
+def _z_coefficient(config: dict, tokens: int) -> float:
+    coefficient = float(config.get("z_loss_coefficient", 0.0))
+    if not coefficient:
+        return 0.0
+    if not config.get("z_anneal_80_95", False):
+        return coefficient
+    progress = tokens / int(config["token_budget"])
+    return coefficient * max(0.0, min(1.0, (0.95 - progress) / 0.15))
+
+
 def train(config: dict, run_dir: str, resume: str | None = None):
     global _STOP
     _STOP = False
@@ -405,8 +490,13 @@ def train(config: dict, run_dir: str, resume: str | None = None):
     micro_batch = int(config["micro_batch_size"])
     grad_accum = int(config["gradient_accumulation"])
     batch_tokens = micro_batch * grad_accum * context_length
-    total_steps = int(config["token_budget"]) // batch_tokens
-    validate_steps = int(config["validate_every"]) // batch_tokens
+    use_phases = bool(config.get("batch_phases"))
+    total_steps = (
+        _total_updates(config)
+        if use_phases
+        else int(config["token_budget"]) // batch_tokens
+    )
+    validate_every = int(config["validate_every"])
     milestones = {int(m) for m in config.get("milestones", [])}
     token_budget = int(config["token_budget"])
 
@@ -414,14 +504,24 @@ def train(config: dict, run_dir: str, resume: str | None = None):
         model_config, dropout=float(config.get("dropout", 0.0))
     ).to(device)
     _apply_model_options(model, config)
+    if config.get("vocabulary_weight_tying", False):
+        # Share the LM-head initializer (std ~ 1/sqrt(d)) rather than the
+        # embedding's unit-std tensor, matching the recipe's initialization.
+        model.token_embeddings.weight = model.lm_head.weight
     model.train()
-    optimizer = AdamW(
-        _optimizer_parameters(model, config),
-        lr=float(config["learning_rate"]),
-        betas=tuple(config["betas"]),
-        eps=float(config["eps"]),
-        weight_decay=float(config["weight_decay"]),
-    )
+    hybrid_muon = config.get("optimizer") == "hybrid_muon"
+    if hybrid_muon:
+        optimizer = HybridMuonAdamW(model, config)
+    else:
+        optimizer = AdamW(
+            _optimizer_parameters(model, config),
+            lr=float(config["learning_rate"]),
+            betas=tuple(config["betas"]),
+            eps=float(config["eps"]),
+            weight_decay=float(config["weight_decay"]),
+        )
+    if config.get("untie_at_tokens") and not hybrid_muon:
+        raise ValueError("untie_at_tokens requires optimizer=hybrid_muon")
     token_weights = _build_token_weights(
         train_tokens_data, float(config.get("token_loss_weight_alpha", 0.0))
     )
@@ -447,6 +547,12 @@ def train(config: dict, run_dir: str, resume: str | None = None):
 
     if resume:
         checkpoint = torch.load(resume, map_location=device, weights_only=False)
+        if (
+            hybrid_muon
+            and config.get("untie_at_tokens")
+            and int(checkpoint.get("train_tokens", 0)) >= int(config["untie_at_tokens"])
+        ):
+            optimizer.untie(model)
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         if scaler is not None and checkpoint.get("scaler"):
@@ -515,7 +621,7 @@ def train(config: dict, run_dir: str, resume: str | None = None):
         if 0 in milestones:
             milestones_saved.add(0)
 
-    accumulation = grad_accum
+    next_validate = (train_tokens // validate_every + 1) * validate_every
     loss_since_log = 0.0
     last_log_time = time.time()
     interrupted = False
@@ -532,9 +638,28 @@ def train(config: dict, run_dir: str, resume: str | None = None):
                 interrupted = True
                 break
 
-            lr = _lr_at(step, config, total_steps)
+            if (
+                hybrid_muon
+                and config.get("untie_at_tokens")
+                and train_tokens >= int(config["untie_at_tokens"])
+                and model.lm_head.weight is model.token_embeddings.weight
+            ):
+                optimizer.untie(model)
+                print(f"[untie] LM head separated at {train_tokens} tokens")
+
+            quantum = (
+                _update_quantum(config, train_tokens) if use_phases else batch_tokens
+            )
+            accumulation = quantum // (micro_batch * context_length)
+            target_tokens = train_tokens + quantum
+            if use_phases or config.get("lr_schedule") == "warmup_stable_decay":
+                lr = _token_lr(target_tokens, config)
+            else:
+                lr = _lr_at(step, config, total_steps)
             for group in optimizer.param_groups:
-                group["lr"] = lr
+                group["lr"] = lr * group.get("lr_multiplier", 1.0)
+            smoothing = _label_smoothing(config, target_tokens)
+            z_coefficient = _z_coefficient(config, target_tokens)
 
             optimizer.zero_grad(set_to_none=True)
             accumulated_loss = None
@@ -557,20 +682,26 @@ def train(config: dict, run_dir: str, resume: str | None = None):
                     device_type=device.type, dtype=amp_dtype, enabled=use_amp
                 ):
                     logits = model(x)
+                    flat = logits.reshape(-1, vocab_size).float()
                     if token_weights is None:
-                        loss = cross_entropy(
-                            logits.reshape(-1, vocab_size).float(), y.reshape(-1)
-                        )
-                        log_loss = loss.detach()
+                        ce = cross_entropy(flat, y.reshape(-1))
+                        if smoothing:
+                            loss = torch.nn.functional.cross_entropy(
+                                flat, y.reshape(-1), label_smoothing=smoothing
+                            )
+                        else:
+                            loss = ce
+                        log_loss = ce.detach()
                     else:
-                        per_token_loss = cross_entropy_per_token(
-                            logits.reshape(-1, vocab_size).float(), y.reshape(-1)
-                        )
+                        per_token_loss = cross_entropy_per_token(flat, y.reshape(-1))
                         weights = token_weights[y.reshape(-1)]
                         loss = (per_token_loss * weights).sum() / weights.sum()
                         # The logged train_loss stays the ordinary (unweighted)
                         # target mean; only the gradient uses the weights.
                         log_loss = per_token_loss.detach().mean()
+                    if z_coefficient:
+                        # STZ regularizer on the logits; annealed to zero late.
+                        loss = loss + z_coefficient * flat.logsumexp(-1).square().mean()
                 accumulated_loss = (
                     log_loss if accumulated_loss is None else accumulated_loss + log_loss
                 )
@@ -590,7 +721,7 @@ def train(config: dict, run_dir: str, resume: str | None = None):
                 optimizer.step()
 
             step += 1
-            train_tokens += batch_tokens
+            train_tokens = target_tokens
             train_loss = float(accumulated_loss / accumulation)
             write_row(
                 writer,
@@ -602,7 +733,7 @@ def train(config: dict, run_dir: str, resume: str | None = None):
                 elapsed_seconds=elapsed(),
             )
 
-            if step % validate_steps == 0:
+            if train_tokens >= next_validate:
                 nll = evaluate_nll(
                     model,
                     valid_tokens_data,
@@ -629,6 +760,8 @@ def train(config: dict, run_dir: str, resume: str | None = None):
                     f"train_loss {train_loss:.4f} valid_nll {nll:.6f} "
                     f"lr {lr:.3e} elapsed {elapsed():.1f}s"
                 )
+                while next_validate <= train_tokens:
+                    next_validate += validate_every
 
             for milestone in milestones:
                 if train_tokens >= milestone and milestone not in milestones_saved:
