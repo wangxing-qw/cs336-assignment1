@@ -156,6 +156,9 @@ class MultiHeadSelfAttention(nn.Module):
         self.v_proj = Linear(d_model, d_model, device=device, dtype=dtype)
         self.output_proj = Linear(d_model, d_model, device=device, dtype=dtype)
         self.rope = RoPE(self.d_head, rope_theta, max_seq_len, device=device) if use_rope else None
+        # Training-only fast path; the default stays the explicit implementation
+        # so tests and the teacher's probe see identical numerics.
+        self.use_sdpa = False
 
     def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
         # (..., seq, d_model) -> (..., heads, seq, d_head) -> (prod(leading), seq, d_head)
@@ -170,10 +173,13 @@ class MultiHeadSelfAttention(nn.Module):
         if self.rope is not None:
             q = self.rope(q, token_positions)
             k = self.rope(k, token_positions)
-        causal = torch.tril(
-            torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device)
-        )
-        out = scaled_dot_product_attention(q, k, v, mask=causal)
+        if self.use_sdpa:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            causal = torch.tril(
+                torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device)
+            )
+            out = scaled_dot_product_attention(q, k, v, mask=causal)
         out = out.reshape(*leading, self.num_heads, seq_len, self.d_head).transpose(-3, -2)
         out = out.flatten(-2)
         return self.output_proj(out)
@@ -192,12 +198,15 @@ class TransformerBlock(nn.Module):
         ffn: str = "swiglu",
         device=None,
         dtype=None,
+        dropout: float = 0.0,
     ):
         super().__init__()
         assert norm in {"pre", "post", "none"}
         assert position in {"rope", "none"}
         assert ffn in {"swiglu", "silu"}
         self.norm = norm
+        self.drop_attn = nn.Dropout(dropout)
+        self.drop_ffn = nn.Dropout(dropout)
         self.attn = MultiHeadSelfAttention(
             d_model,
             num_heads,
@@ -217,14 +226,14 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, token_positions: torch.Tensor | None = None) -> torch.Tensor:
         if self.norm == "pre":
-            x = x + self.attn(self.ln1(x), token_positions)
-            x = x + self.ffn(self.ln2(x))
+            x = x + self.drop_attn(self.attn(self.ln1(x), token_positions))
+            x = x + self.drop_ffn(self.ffn(self.ln2(x)))
         elif self.norm == "post":
-            x = self.ln1(x + self.attn(x, token_positions))
-            x = self.ln2(x + self.ffn(x))
+            x = self.ln1(x + self.drop_attn(self.attn(x, token_positions)))
+            x = self.ln2(x + self.drop_ffn(self.ffn(x)))
         else:
-            x = x + self.attn(x, token_positions)
-            x = x + self.ffn(x)
+            x = x + self.drop_attn(self.attn(x, token_positions))
+            x = x + self.drop_ffn(self.ffn(x))
         return x
 
 
@@ -243,12 +252,14 @@ class TransformerLM(nn.Module):
         ffn: str = "swiglu",
         device=None,
         dtype=None,
+        dropout: float = 0.0,
     ):
         super().__init__()
         self.vocab_size = vocab_size
         self.context_length = context_length
         self.norm = norm
         self.token_embeddings = Embedding(vocab_size, d_model, device=device, dtype=dtype)
+        self.drop_emb = nn.Dropout(dropout)
         self.layers = nn.ModuleList(
             [
                 TransformerBlock(
@@ -262,6 +273,7 @@ class TransformerLM(nn.Module):
                     ffn=ffn,
                     device=device,
                     dtype=dtype,
+                    dropout=dropout,
                 )
                 for _ in range(num_layers)
             ]
@@ -271,7 +283,7 @@ class TransformerLM(nn.Module):
         self.lm_head = Linear(d_model, vocab_size, device=device, dtype=dtype)
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        x = self.token_embeddings(token_ids)
+        x = self.drop_emb(self.token_embeddings(token_ids))
         for layer in self.layers:
             x = layer(x)
         if self.norm != "none":
@@ -279,7 +291,7 @@ class TransformerLM(nn.Module):
         return self.lm_head(x)
 
 
-def build_model(model_config: dict, device=None, dtype=None) -> TransformerLM:
+def build_model(model_config: dict, device=None, dtype=None, dropout: float = 0.0) -> TransformerLM:
     cfg = dict(model_config)
     return TransformerLM(
         vocab_size=cfg["vocab_size"],
@@ -294,4 +306,5 @@ def build_model(model_config: dict, device=None, dtype=None) -> TransformerLM:
         ffn=cfg.get("ffn", "swiglu"),
         device=device,
         dtype=dtype,
+        dropout=dropout,
     )

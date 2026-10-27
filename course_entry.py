@@ -15,13 +15,14 @@ import math
 import os
 import random
 import shutil
+import signal
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from basics.model import build_model
+from basics.model import Embedding, Linear, MultiHeadSelfAttention, build_model
 from basics.nn_utils import cross_entropy, cross_entropy_per_token, gradient_clipping
 from basics.optimizer import AdamW, get_lr_cosine_schedule
 
@@ -35,6 +36,143 @@ CSV_FIELDS = [
     "lr",
     "elapsed_seconds",
 ]
+
+# Set by SIGINT/SIGTERM; the training loop saves a full checkpoint and exits at
+# the next update boundary. A stop file (config["stop_file"]) is checked too.
+_STOP = False
+
+
+def _handle_stop(signum, frame):
+    global _STOP
+    _STOP = True
+    print(f"[stop] signal {signum} received; saving at the next update boundary", flush=True)
+
+
+def _install_stop_handlers() -> dict:
+    handlers = {}
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            handlers[sig] = signal.signal(sig, _handle_stop)
+        except (ValueError, OSError):
+            pass
+    return handlers
+
+
+def _restore_stop_handlers(handlers: dict) -> None:
+    for sig, handler in handlers.items():
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError):
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Training-only options (all default to the original behavior)
+# ---------------------------------------------------------------------------
+def _apply_model_options(model, config: dict) -> None:
+    """Dropout / SDPA / initialization options, all opt-in via config."""
+    dropout = float(config.get("dropout", 0.0))
+    use_sdpa = bool(config.get("sdpa", False))
+    for module in model.modules():
+        if isinstance(module, torch.nn.Dropout):
+            module.p = dropout
+        elif isinstance(module, MultiHeadSelfAttention):
+            # Training-only fast path; evaluation still uses the explicit
+            # implementation so teacher probes and tests see the same numerics.
+            module.use_sdpa = use_sdpa
+    if config.get("init_gpt2", False):
+        for module in model.modules():
+            if isinstance(module, Linear):
+                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            elif isinstance(module, Embedding):
+                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    if config.get("init_residual_scale", False):
+        num_layers = int(_resolve_model_config(config)["num_layers"])
+        scale = 1.0 / math.sqrt(2.0 * num_layers)
+        for layer in model.layers:
+            layer.attn.output_proj.weight.data.mul_(scale)
+            layer.ffn.w2.weight.data.mul_(scale)
+
+
+def _optimizer_parameters(model, config: dict):
+    """Optionally exclude norms/embeddings from weight decay."""
+    exclude_norm = bool(config.get("wd_exclude_norm", False))
+    exclude_embedding = bool(config.get("wd_exclude_embedding", False))
+    if not exclude_norm and not exclude_embedding:
+        return model.parameters()
+    weight_decay = float(config["weight_decay"])
+    decay, no_decay = [], []
+    for name, param in model.named_parameters():
+        skip = (exclude_norm and param.ndim == 1) or (
+            exclude_embedding and ("token_embeddings" in name or "lm_head" in name)
+        )
+        (no_decay if skip else decay).append(param)
+    groups = [{"params": decay, "weight_decay": weight_decay}]
+    if no_decay:
+        groups.append({"params": no_decay, "weight_decay": 0.0})
+    return groups
+
+
+def _build_token_weights(train_tokens: np.ndarray, alpha: float):
+    """Importance weights w(token) proportional to (train frequency)^-alpha."""
+    if not alpha:
+        return None
+    freq = np.bincount(train_tokens, minlength=10000).astype(np.float64)
+    freq[freq <= 0] = 1.0
+    weights = np.power(freq, -float(alpha))
+    weights /= float((weights * freq).sum() / freq.sum())
+    return torch.tensor(weights, dtype=torch.float32)
+
+
+class _EpochWindowSampler:
+    """Deterministic shuffled, non-overlapping windows for uniform coverage.
+
+    Position is derived from the number of tokens already consumed, so resume
+    does not need extra sampler state.
+    """
+
+    def __init__(self, dataset: np.ndarray, context_length: int, seed: int):
+        self.context_length = int(context_length)
+        self.seed = int(seed)
+        self.num_windows = (len(dataset) - 1) // self.context_length
+        if self.num_windows <= 0:
+            raise ValueError("dataset is shorter than context_length")
+        self.epoch = -1
+        self.permutation = None
+
+    def starts(self, window_indices: np.ndarray) -> np.ndarray:
+        epochs = window_indices // self.num_windows
+        starts = np.empty(len(window_indices), dtype=np.int64)
+        for epoch in np.unique(epochs):
+            if int(epoch) != self.epoch:
+                self.epoch = int(epoch)
+                self.permutation = np.random.default_rng(
+                    self.seed + self.epoch
+                ).permutation(self.num_windows)
+            mask = epochs == epoch
+            starts[mask] = (
+                self.permutation[window_indices[mask] - epoch * self.num_windows]
+                * self.context_length
+            )
+        return starts
+
+
+def _get_epoch_batch(
+    dataset: np.ndarray,
+    sampler: _EpochWindowSampler,
+    batch_size: int,
+    context_length: int,
+    token_offset: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    first = token_offset // context_length
+    starts = sampler.starts(first + np.arange(batch_size))
+    offsets = np.arange(context_length + 1)
+    indices = starts[:, None] + offsets[None, :]
+    windows = dataset[indices].astype(np.int64)
+    x = torch.from_numpy(windows[:, :-1].copy()).to(device, non_blocking=True)
+    y = torch.from_numpy(windows[:, 1:].copy()).to(device, non_blocking=True)
+    return x, y
 
 
 # ---------------------------------------------------------------------------
@@ -99,9 +237,12 @@ def _set_rng_state(state: dict) -> None:
     if "numpy" in state:
         np.random.set_state(state["numpy"])
     if "torch" in state:
-        torch.set_rng_state(state["torch"])
+        # map_location may have moved this CPU state tensor to the GPU.
+        torch.set_rng_state(torch.as_tensor(state["torch"], dtype=torch.uint8, device="cpu"))
     if "cuda" in state and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["cuda"])
+        torch.cuda.set_rng_state_all(
+            [torch.as_tensor(s, dtype=torch.uint8, device="cpu") for s in state["cuda"]]
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +273,15 @@ def evaluate_nll(model, valid_tokens, context_length, batch_size, device) -> flo
     total_count = 0
     previous_tf32 = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
+    attention_modules = [
+        m for m in model.modules() if isinstance(m, MultiHeadSelfAttention)
+    ]
+    sdpa_flags = [m.use_sdpa for m in attention_modules]
     try:
+        # Evaluation must match the explicit reference attention exactly, so
+        # the reported NLL is directly comparable with the teacher's rerun.
+        for module in attention_modules:
+            module.use_sdpa = False
         was_training = model.training
         model.eval()
         for start in range(0, x.shape[0], batch_size):
@@ -149,6 +298,8 @@ def evaluate_nll(model, valid_tokens, context_length, batch_size, device) -> flo
         if was_training:
             model.train()
     finally:
+        for module, flag in zip(attention_modules, sdpa_flags):
+            module.use_sdpa = flag
         torch.backends.cuda.matmul.allow_tf32 = previous_tf32
     return total_loss / n_targets
 
@@ -182,13 +333,53 @@ def _save_checkpoint(path: Path, payload: dict) -> None:
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
+def _lr_at(step: int, config: dict, total_steps: int) -> float:
+    """Learning rate for an update.
+
+    The default (``lr_schedule`` absent or ``"cosine"``) is exactly the course's
+    cosine schedule. Alternatives are training-only experiments:
+    ``"wsd"`` holds the peak rate then anneals over the final fraction, and
+    ``"linear"`` anneals linearly from the end of warmup.
+    """
+    peak = float(config["learning_rate"])
+    min_lr = float(config["min_learning_rate"])
+    warmup = int(config["warmup_steps"])
+    schedule = config.get("lr_schedule", "cosine")
+    if schedule == "cosine":
+        return get_lr_cosine_schedule(step, peak, min_lr, warmup, total_steps)
+    if step < warmup:
+        return peak * step / warmup if warmup else peak
+    progress = (step - warmup) / max(1, total_steps - warmup)
+    if schedule == "wsd":
+        start = float(config.get("decay_start_frac", 0.8))
+        if progress < start:
+            return peak
+        t = (progress - start) / max(1e-9, 1.0 - start)
+    elif schedule == "linear":
+        t = progress
+    else:
+        raise ValueError(f"unknown lr_schedule {schedule}")
+    t = min(1.0, max(0.0, t))
+    if config.get("decay_shape", "cos") == "lin":
+        factor = 1.0 - t
+    else:
+        factor = 0.5 * (1.0 + math.cos(math.pi * t))
+    return min_lr + (peak - min_lr) * factor
+
+
 def train(config: dict, run_dir: str, resume: str | None = None):
+    global _STOP
+    _STOP = False
     config = copy.deepcopy(config)
     mode = config.get("mode", "ranked")
     _validate_config(config, mode)
 
     run_path = Path(run_dir)
     run_path.mkdir(parents=True, exist_ok=True)
+    if resume is None:
+        # A fresh start must not pick up a stale resumable checkpoint.
+        for stale in ("latest.pt", "interrupt.pt"):
+            (run_path / stale).unlink(missing_ok=True)
     (run_path / "config.json").write_text(
         json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
@@ -219,15 +410,29 @@ def train(config: dict, run_dir: str, resume: str | None = None):
     milestones = {int(m) for m in config.get("milestones", [])}
     token_budget = int(config["token_budget"])
 
-    model = build_model(model_config).to(device)
+    model = build_model(
+        model_config, dropout=float(config.get("dropout", 0.0))
+    ).to(device)
+    _apply_model_options(model, config)
     model.train()
     optimizer = AdamW(
-        model.parameters(),
+        _optimizer_parameters(model, config),
         lr=float(config["learning_rate"]),
         betas=tuple(config["betas"]),
         eps=float(config["eps"]),
         weight_decay=float(config["weight_decay"]),
     )
+    token_weights = _build_token_weights(
+        train_tokens_data, float(config.get("token_loss_weight_alpha", 0.0))
+    )
+    if token_weights is not None:
+        token_weights = token_weights.to(device)
+    sampler = None
+    if config.get("sampler", "random") == "epoch":
+        sampler = _EpochWindowSampler(train_tokens_data, context_length, int(seed))
+    stop_path = Path(config["stop_file"]) if config.get("stop_file") else None
+    checkpoint_every = int(config.get("checkpoint_every", 0) or 0)
+    handlers = _install_stop_handlers()
 
     precision = config.get("precision", "bf16")
     use_amp = precision in {"bf16", "fp16"} and device.type == "cuda"
@@ -255,7 +460,11 @@ def train(config: dict, run_dir: str, resume: str | None = None):
         if source_metrics.is_file():
             with source_metrics.open(encoding="utf-8", newline="") as stream:
                 for row in csv.DictReader(stream):
-                    if int(row["step"]) <= step:
+                    # A crash mid-write can leave a truncated/zero-filled row; skip it.
+                    raw_step = (row.get("step") or "").strip()
+                    if not raw_step.isdigit():
+                        continue
+                    if int(raw_step) <= step:
                         resumed_metrics.append(row)
         source_best = Path(checkpoint.get("run_dir", "")) / "best.pt"
         if source_best.is_file() and not (run_path / "best.pt").exists():
@@ -309,33 +518,62 @@ def train(config: dict, run_dir: str, resume: str | None = None):
     accumulation = grad_accum
     loss_since_log = 0.0
     last_log_time = time.time()
+    interrupted = False
+    best_path = run_path / "best.pt"
+    latest_path = run_path / "latest.pt"
+    interrupt_path = run_path / "interrupt.pt"
+
+    def stop_requested() -> bool:
+        return _STOP or (stop_path is not None and stop_path.exists())
 
     try:
         while step < total_steps:
-            lr = get_lr_cosine_schedule(
-                step,
-                float(config["learning_rate"]),
-                float(config["min_learning_rate"]),
-                int(config["warmup_steps"]),
-                total_steps,
-            )
+            if stop_requested():
+                interrupted = True
+                break
+
+            lr = _lr_at(step, config, total_steps)
             for group in optimizer.param_groups:
                 group["lr"] = lr
 
             optimizer.zero_grad(set_to_none=True)
-            accumulated_loss = 0.0
-            for _ in range(accumulation):
-                x, y = _get_training_batch(
-                    train_tokens_data, micro_batch, context_length, device
-                )
+            accumulated_loss = None
+            for micro in range(accumulation):
+                if sampler is None:
+                    x, y = _get_training_batch(
+                        train_tokens_data, micro_batch, context_length, device
+                    )
+                else:
+                    offset = train_tokens + micro * micro_batch * context_length
+                    x, y = _get_epoch_batch(
+                        train_tokens_data,
+                        sampler,
+                        micro_batch,
+                        context_length,
+                        offset,
+                        device,
+                    )
                 with torch.autocast(
                     device_type=device.type, dtype=amp_dtype, enabled=use_amp
                 ):
                     logits = model(x)
-                    loss = cross_entropy(
-                        logits.reshape(-1, vocab_size).float(), y.reshape(-1)
-                    )
-                accumulated_loss += float(loss.detach())
+                    if token_weights is None:
+                        loss = cross_entropy(
+                            logits.reshape(-1, vocab_size).float(), y.reshape(-1)
+                        )
+                        log_loss = loss.detach()
+                    else:
+                        per_token_loss = cross_entropy_per_token(
+                            logits.reshape(-1, vocab_size).float(), y.reshape(-1)
+                        )
+                        weights = token_weights[y.reshape(-1)]
+                        loss = (per_token_loss * weights).sum() / weights.sum()
+                        # The logged train_loss stays the ordinary (unweighted)
+                        # target mean; only the gradient uses the weights.
+                        log_loss = per_token_loss.detach().mean()
+                accumulated_loss = (
+                    log_loss if accumulated_loss is None else accumulated_loss + log_loss
+                )
                 scaled = loss / accumulation
                 if scaler is not None:
                     scaler.scale(scaled).backward()
@@ -353,7 +591,7 @@ def train(config: dict, run_dir: str, resume: str | None = None):
 
             step += 1
             train_tokens += batch_tokens
-            train_loss = accumulated_loss / accumulation
+            train_loss = float(accumulated_loss / accumulation)
             write_row(
                 writer,
                 event="train",
@@ -385,7 +623,7 @@ def train(config: dict, run_dir: str, resume: str | None = None):
                 )
                 if nll < best_nll:
                     best_nll = nll
-                    save_full_checkpoint(run_path / "best.pt")
+                    save_full_checkpoint(best_path)
                 print(
                     f"step {step}/{total_steps} tokens {train_tokens} "
                     f"train_loss {train_loss:.4f} valid_nll {nll:.6f} "
@@ -398,6 +636,18 @@ def train(config: dict, run_dir: str, resume: str | None = None):
                     percent = round(100 * milestone / token_budget)
                     save_full_checkpoint(run_path / f"checkpoint_{percent:03d}.pt")
 
+            if checkpoint_every and step % checkpoint_every == 0:
+                save_full_checkpoint(latest_path)
+
+            if stop_requested():
+                interrupted = True
+                save_full_checkpoint(interrupt_path)
+                print(
+                    f"[stop] saved {interrupt_path} at step {step}; "
+                    f"resume with --resume {interrupt_path}"
+                )
+                break
+
             now = time.time()
             if now - last_log_time > 300:
                 last_log_time = now
@@ -407,11 +657,24 @@ def train(config: dict, run_dir: str, resume: str | None = None):
                 )
     finally:
         stream.close()
+        _restore_stop_handlers(handlers)
 
-    # Guarantee the final model is represented even for smoke budgets without a
-    # validation boundary.
-    if not (run_path / "best.pt").exists():
-        save_full_checkpoint(run_path / "best.pt")
+    # Guarantee a usable best checkpoint even for smoke budgets without a
+    # validation boundary or a run stopped before the first validation.
+    if not best_path.exists():
+        save_full_checkpoint(best_path)
+    if step < total_steps:
+        save_full_checkpoint(interrupt_path)
+        print(
+            f"training interrupted: step {step}/{total_steps}, tokens {train_tokens}, "
+            f"best_nll {best_nll:.6f}"
+        )
+        return {
+            "step": step,
+            "train_tokens": train_tokens,
+            "best_valid_nll": best_nll,
+            "interrupted": True,
+        }
     save_full_checkpoint(run_path / "checkpoint_100.pt")
     print(f"training finished: step {step}, tokens {train_tokens}, best_nll {best_nll:.6f}")
     return {"step": step, "train_tokens": train_tokens, "best_valid_nll": best_nll}
